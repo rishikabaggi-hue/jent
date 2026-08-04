@@ -281,11 +281,11 @@ def step_extra_channels(env: dict):
 
 
 # --------------------------------------------------------------------------- #
-# Step 4 - Verify
+# Step 5 - Verify
 # --------------------------------------------------------------------------- #
 
 def step_verify():
-    _h("Step 4  -  Verification  (dry run)")
+    _h("Step 5  -  Verification  (dry run)")
     print()
     _info("Running one dry-run cycle to confirm everything is reachable.")
     _info("(Takes 2-3 minutes because Playwright browser scrapers run too.)")
@@ -375,6 +375,9 @@ def main():
             _save_env(env)
 
         step_resume()
+        step_mongodb(env)
+        if env:
+            _save_env(env)
 
         step_extra_channels(env)
         if env:

@@ -10,14 +10,16 @@ Usage:
 Then open http://localhost:8765 in your browser.
 """
 import json
-import sys
 import os
+import re
 import hmac
 import hashlib
+import base64
 import uuid
-import calendar
+import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from tempfile import NamedTemporaryFile
 from flask import Flask, jsonify, send_from_directory, request, redirect
 
 BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
@@ -29,6 +31,10 @@ SUBSCRIPTIONS_FILE = BASE_DIR / "subscriptions.json"
 DASHBOARD_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
 ALLOWED_RESUME_EXTS = {".pdf", ".docx", ".doc"}
+MAX_RESUME_SIZE_BYTES = 5 * 1024 * 1024
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^\d{10,15}$")
+log = logging.getLogger(__name__)
 
 # ── Cashfree / Subscription config ───────────────────────────────────────────
 def _load_yaml_cfg() -> dict:
@@ -66,6 +72,7 @@ _CF_JS = (
 )
 
 app = Flask(__name__, static_folder=str(DASHBOARD_DIR), static_url_path="")
+app.config["MAX_CONTENT_LENGTH"] = MAX_RESUME_SIZE_BYTES
 
 import requests as _requests   # for Cashfree API calls
 
@@ -93,6 +100,62 @@ def tail_log(n: int = 200) -> list:
         return [l.rstrip() for l in lines[-n:]]
     except Exception:
         return []
+
+
+def _parse_float_arg(name: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+    raw = request.args.get(name, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _parse_int_arg(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = request.args.get(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _write_json_atomic(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile("w", encoding="utf-8", dir=str(path.parent), delete=False) as tmp:
+        json.dump(data, tmp, indent=2, ensure_ascii=False)
+        temp_name = tmp.name
+    os.replace(temp_name, path)
+
+
+def _validate_email(value: str) -> bool:
+    return bool(EMAIL_RE.match((value or "").strip()))
+
+
+def _normalize_phone(value: str) -> str:
+    digits = re.sub(r"\D+", "", value or "")
+    return digits
+
+
+def _verify_cashfree_signature() -> bool:
+    signature = request.headers.get("x-webhook-signature", "")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    if not CASHFREE_SECRET or not signature or not timestamp:
+        return False
+    raw_body = request.get_data(cache=True, as_text=True)
+    payload = f"{timestamp}{raw_body}".encode("utf-8")
+    expected = base64.b64encode(
+        hmac.new(CASHFREE_SECRET.encode("utf-8"), payload, digestmod=hashlib.sha256).digest()
+    ).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
 
 
 def find_resume():
@@ -124,8 +187,7 @@ def load_subscriptions() -> dict:
 
 
 def save_subscriptions(data: dict):
-    with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    _write_json_atomic(SUBSCRIPTIONS_FILE, data)
 
 
 def get_active_subscriber() -> dict | None:
@@ -143,7 +205,7 @@ def get_active_subscriber() -> dict | None:
             if now - sub_date <= timedelta(days=31):
                 return sub
         except Exception:
-            return sub  # if date parsing fails, treat as valid
+            log.warning("Ignoring malformed subscription record: %r", sub)
     return None
 
 
@@ -155,6 +217,15 @@ def _cf_headers() -> dict:
         "Content-Type": "application/json",
     }
 
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # -- API Routes ---------------------------------------------------------------
@@ -178,7 +249,7 @@ def api_jobs():
         })
     jobs.sort(key=lambda j: (j["score"], j["found_at"]), reverse=True)
 
-    min_score = float(request.args.get("min_score", 0))
+    min_score = _parse_float_arg("min_score", 0.0, minimum=0.0, maximum=1.0)
     source_filter = request.args.get("source", "").strip().lower()
     if min_score > 0:
         jobs = [j for j in jobs if j["score"] >= min_score]
@@ -225,7 +296,7 @@ def api_stats():
 
 @app.route("/api/log")
 def api_log():
-    n = int(request.args.get("n", 150))
+    n = _parse_int_arg("n", 150, minimum=1, maximum=1000)
     return jsonify({"lines": tail_log(n)})
 
 
@@ -277,16 +348,18 @@ def api_create_order():
     if not CASHFREE_APP_ID or not CASHFREE_SECRET:
         return jsonify({"error": "Cashfree credentials not configured in config.yaml"}), 500
 
-    body = request.get_json(force=True) or {}
+    body = request.get_json(silent=True) or {}
     customer_name  = (body.get("name") or "").strip() or "JENT User"
     customer_email = (body.get("email") or "").strip()
-    customer_phone = (body.get("phone") or "").strip() or "9999999999"
+    customer_phone = _normalize_phone(body.get("phone") or "") or "9999999999"
 
-    if not customer_email:
+    if not _validate_email(customer_email):
         return jsonify({"error": "Email is required"}), 400
+    if not PHONE_RE.match(customer_phone):
+        return jsonify({"error": "A valid phone number is required"}), 400
 
     order_id = f"jent_{uuid.uuid4().hex[:12]}"
-    return_url = request.host_url.rstrip("/") + f"/api/payment-success?order_id={order_id}&email={customer_email}"
+    return_url = request.host_url.rstrip("/") + f"/api/payment-success?order_id={order_id}"
 
     payload = {
         "order_id": order_id,
@@ -328,7 +401,6 @@ def api_create_order():
 def api_payment_success():
     """Cashfree redirects here after payment. Verify and activate subscription."""
     order_id = request.args.get("order_id", "")
-    email    = request.args.get("email", "")
 
     activated = False
     if order_id and CASHFREE_APP_ID:
@@ -344,9 +416,10 @@ def api_payment_success():
             if status == "PAID":
                 payments = order_data.get("order_payment_details", {})
                 payment_id = str(payments.get("payment_id", order_id))
+                customer = order_data.get("customer_details", {})
                 _activate_subscription(
-                    email=email,
-                    name=order_data.get("customer_details", {}).get("customer_name", ""),
+                    email=customer.get("customer_email", ""),
+                    name=customer.get("customer_name", ""),
                     order_id=order_id,
                     payment_id=payment_id,
                     amount=SUBSCRIPTION_AMT,
@@ -362,7 +435,7 @@ def api_payment_success():
 @app.route("/api/verify-payment", methods=["POST"])
 def api_verify_payment():
     """Frontend calls this to verify an order and activate subscription."""
-    body = request.get_json(force=True) or {}
+    body = request.get_json(silent=True) or {}
     order_id = body.get("order_id", "")
     email    = body.get("email", "")
 
@@ -399,8 +472,11 @@ def api_verify_payment():
 @app.route("/api/payment-webhook", methods=["POST"])
 def api_payment_webhook():
     """Cashfree server-to-server payment notification."""
+    if not _verify_cashfree_signature():
+        log.warning("Rejected Cashfree webhook with invalid signature")
+        return jsonify({"error": "invalid signature"}), 400
     try:
-        data = request.get_json(force=True) or {}
+        data = request.get_json(silent=True) or {}
         order = data.get("data", {}).get("order", {})
         payment = data.get("data", {}).get("payment", {})
         if payment.get("payment_status") == "SUCCESS":
@@ -414,8 +490,9 @@ def api_payment_webhook():
                 payment_id=str(payment_id),
                 amount=SUBSCRIPTION_AMT,
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to process payment webhook: %s", exc)
+        return jsonify({"error": "invalid webhook payload"}), 400
     return jsonify({"status": "ok"})
 
 
@@ -457,18 +534,20 @@ def api_upload_resume():
     ext = Path(f.filename).suffix.lower()
     if ext not in ALLOWED_RESUME_EXTS:
         return jsonify({"error": f"Unsupported file type '{ext}'. Use PDF or DOCX."}), 400
+    if request.content_length and request.content_length > MAX_RESUME_SIZE_BYTES:
+        return jsonify({"error": "Resume file is too large. Maximum size is 5 MB."}), 400
 
-    # Remove old resume files before saving new one
+    save_path = BASE_DIR / f"resume{ext}"
+    tmp_path = save_path.with_suffix(f"{save_path.suffix}.uploading")
+    f.save(str(tmp_path))
     for old_ext in ALLOWED_RESUME_EXTS:
         old = BASE_DIR / f"resume{old_ext}"
-        if old.exists():
+        if old.exists() and old != save_path:
             try:
                 old.unlink()
             except Exception:
-                pass
-
-    save_path = BASE_DIR / f"resume{ext}"
-    f.save(str(save_path))
+                log.warning("Could not remove old resume file: %s", old)
+    os.replace(tmp_path, save_path)
     stat = save_path.stat()
 
     return jsonify({

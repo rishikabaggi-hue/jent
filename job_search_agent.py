@@ -28,19 +28,22 @@ SETUP
 import os
 import re
 import sys
+import html
 import json
 import time
-import math
 import signal
 import logging
 import smtplib
 import requests
 import feedparser
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import db
 
 # -----------------------------------------------------------------------
@@ -53,6 +56,7 @@ LOG_DIR = BASE_DIR / "log"
 LOG_FILE = LOG_DIR / "agent.log"
 CYCLE_STATS_FILE = LOG_DIR / "cycle_stats.json"
 
+log = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------
 # CONFIG — load config.yaml first, then env vars override
@@ -66,7 +70,7 @@ def _load_yaml_config() -> dict:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except Exception as e:
-        print(f"[WARN] Could not load config.yaml: {e}")
+        log.warning("Could not load config.yaml: %s", e)
         return {}
 
 
@@ -90,7 +94,7 @@ def _load_dotenv():
                 if key and key not in os.environ:  # env vars still win
                     os.environ[key] = val
     except Exception as e:
-        print(f"[WARN] Could not load .env: {e}")
+        log.warning("Could not load .env: %s", e)
 
 
 _load_dotenv()
@@ -231,6 +235,8 @@ SYNONYM_MAP = {
     r"\bpy\b": "python",
 }
 
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
 # -----------------------------------------------------------------------
 # SUBSCRIPTION GATE
 # -----------------------------------------------------------------------
@@ -261,12 +267,13 @@ def check_subscription() -> bool:
                 sub_date = datetime.fromisoformat(sub["subscribed_at"])
                 if now - sub_date <= timedelta(days=31):
                     log.info(
-                        f"[Subscription] Active — {sub.get('email', '')} "
-                        f"(subscribed {sub_date.strftime('%Y-%m-%d')})"
+                        "[Subscription] Active - %s (subscribed %s)",
+                        sub.get("email", ""),
+                        sub_date.strftime("%Y-%m-%d"),
                     )
                     return True
             except Exception:
-                return True  # date parse failure → treat as valid
+                log.warning("[Subscription] Ignoring malformed subscription record: %r", sub)
         # All records expired
         log.warning(
             "[Subscription] Subscription expired. "
@@ -287,7 +294,7 @@ _DRY_RUN = "--dry-run" in sys.argv
 
 def _handle_stop(signum, frame):
     global _RUNNING
-    print("\nStop signal received — finishing current cycle then exiting.")
+    log.info("Stop signal received - finishing current cycle then exiting.")
     _RUNNING = False
 
 
@@ -302,6 +309,7 @@ def setup_logging():
     LOG_DIR.mkdir(exist_ok=True)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+    root.handlers.clear()
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -321,6 +329,7 @@ def setup_logging():
     root.addHandler(ch)
 
 
+log = logging.getLogger(__name__)
 setup_logging()
 log = logging.getLogger(__name__)
 
@@ -386,8 +395,25 @@ def expand_synonyms(text: str) -> str:
 # -----------------------------------------------------------------------
 # SOURCE FETCHERS
 # -----------------------------------------------------------------------
-_SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; job-search-agent/3.0)"})
+def _build_retry_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; job-search-agent/3.0)"})
+    retry = Retry(
+        total=3,
+        read=3,
+        connect=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+_SESSION = _build_retry_session()
 
 
 def _safe_get(url: str, timeout: int = 15, **kwargs):
@@ -397,8 +423,13 @@ def _safe_get(url: str, timeout: int = 15, **kwargs):
         r.raise_for_status()
         return r
     except Exception as e:
-        log.warning(f"GET {url} failed: {e}")
+        log.warning("GET %s failed: %s", url, e)
         return None
+
+
+def _sanitize_external_url(url: str) -> str:
+    candidate = (url or "").strip()
+    return candidate if _URL_RE.match(candidate) else "#"
 
 
 def fetch_remoteok() -> list:
@@ -744,6 +775,36 @@ def fetch_browser_sources() -> tuple:
     return jobs, source_counts
 
 
+def _fetch_source_safe(name: str, fn):
+    try:
+        fetched = fn()
+        return name, fetched or [], None
+    except Exception as exc:
+        return name, [], exc
+
+
+def _dedupe_jobs(jobs: list) -> list:
+    unique_jobs = []
+    seen_ids = set()
+    seen_urls = set()
+    for job in jobs:
+        job_id = job.get("id")
+        job_url = job.get("url", "").strip().lower()
+        dedupe_key = job_id or job_url
+        if not dedupe_key:
+            continue
+        if job_id and job_id in seen_ids:
+            continue
+        if not job_id and job_url and job_url in seen_urls:
+            continue
+        if job_id:
+            seen_ids.add(job_id)
+        if job_url:
+            seen_urls.add(job_url)
+        unique_jobs.append(job)
+    return unique_jobs
+
+
 def fetch_all_sources() -> list:
     sources = [
         ("RemoteOK", fetch_remoteok),
@@ -753,15 +814,19 @@ def fetch_all_sources() -> list:
         ("Remotive", fetch_remotive),
         ("HN Who's Hiring", fetch_hn_whoishiring),
         ("We Work Remotely", fetch_wwr_rss),
-        ("LinkedIn", fetch_linkedin_rss),
     ]
     jobs = []
     source_counts = {}
-    for name, fn in sources:
-        fetched = fn()
-        source_counts[name] = len(fetched)
-        jobs += fetched
-        log.info(f"  {name}: {len(fetched)} listings")
+    max_workers = min(8, len(sources)) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_fetch_source_safe, name, fn): name for name, fn in sources}
+        for future in as_completed(future_map):
+            name, fetched, error = future.result()
+            source_counts[name] = len(fetched)
+            jobs += fetched
+            if error:
+                log.warning("%s fetch failed: %s", name, error)
+            log.info("  %s: %s listings", name, len(fetched))
 
     if GREENHOUSE_COMPANY_SLUGS:
         fetched = fetch_greenhouse(GREENHOUSE_COMPANY_SLUGS)
@@ -778,7 +843,7 @@ def fetch_all_sources() -> list:
         jobs += b_jobs
         source_counts.update(b_counts)
 
-    return jobs, source_counts
+    return _dedupe_jobs(jobs), source_counts
 
 
 # -----------------------------------------------------------------------
@@ -886,11 +951,11 @@ def build_html_email(job: dict) -> str:
     score = job.get("score", 0)
     color = _score_color(score)
     bar = _score_bar(score)
-    title = job.get("title", "Unknown")
-    company = job.get("company", "Unknown")
-    source = job.get("source", "")
-    url = job.get("url", "#")
-    location = job.get("location", "") or "Not specified"
+    title = html.escape(job.get("title", "Unknown"))
+    company = html.escape(job.get("company", "Unknown"))
+    source = html.escape(job.get("source", ""))
+    url = html.escape(_sanitize_external_url(job.get("url", "#")))
+    location = html.escape(job.get("location", "") or "Not specified")
     found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     return f"""<!DOCTYPE html>
@@ -946,7 +1011,7 @@ def send_to_zapier(job: dict) -> bool:
     try:
         resp = _SESSION.post(ZAPIER_WEBHOOK_URL, json=payload, timeout=15)
         resp.raise_for_status()
-        log.info(f"[OK] Zapier: {job['score']:.2f}  {job['title']} @ {job.get('company', '')}")
+        log.info("[OK] Zapier: %.2f  %s @ %s", job["score"], job["title"], job.get("company", ""))
         return True
     except Exception as e:
         log.warning(f"Zapier send failed: {e}")
@@ -994,17 +1059,17 @@ def send_via_telegram(job: dict) -> bool:
         return False
     score = job.get("score", 0)
     text = (
-        f"🎯 *New Job Match* ({score:.0%})\n\n"
-        f"*{job.get('title', '')}*\n"
-        f"🏢 {job.get('company', '')}\n"
-        f"📍 {job.get('location', '') or 'Remote'}\n"
-        f"📡 {job.get('source', '')}\n\n"
-        f"[Apply Now]({job.get('url', '')})"
+        f"New Job Match ({score:.0%})\n\n"
+        f"{job.get('title', '')}\n"
+        f"Company: {job.get('company', '')}\n"
+        f"Location: {job.get('location', '') or 'Remote'}\n"
+        f"Source: {job.get('source', '')}\n"
+        f"Apply: {_sanitize_external_url(job.get('url', ''))}"
     )
     try:
         resp = _SESSION.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=15,
         )
         resp.raise_for_status()
@@ -1021,8 +1086,8 @@ def send_via_discord(job: dict) -> bool:
     score = job.get("score", 0)
     color = int(_score_color(score).lstrip("#"), 16)
     embed = {
-        "title": f"🎯 {job.get('title', '')}",
-        "url": job.get("url", ""),
+        "title": f"New Match: {job.get('title', '')}",
+        "url": _sanitize_external_url(job.get("url", "")),
         "color": color,
         "fields": [
             {"name": "Company", "value": job.get("company", "—"), "inline": True},
@@ -1116,7 +1181,7 @@ def run_once():
                         "location": job.get("location", ""),
                     }
             save_seen(seen)
-        log.info(f"Cycle complete at {datetime.now().isoformat()}.\n")
+    log.info("Cycle complete at %s.\n", datetime.now(timezone.utc).isoformat())
         return 0
 
     for job in ranked:
@@ -1166,7 +1231,7 @@ def run_once():
         })
         save_cycle_stats(stats)
 
-    log.info(f"Cycle complete at {datetime.now().isoformat()}.\n")
+    log.info("Cycle complete at %s.\n", datetime.now(timezone.utc).isoformat())
     return len(ranked)
 
 
