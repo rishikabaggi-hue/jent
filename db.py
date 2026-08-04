@@ -1,5 +1,6 @@
-
-import os, json, logging
+import json
+import logging
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,6 +18,11 @@ MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb://localhost:27017/jent')
 _client = None
 _db = None
 _connected = False
+
+
+def _mongo_set(document: dict) -> dict:
+    """Wrap a document in the MongoDB update operator used for upserts."""
+    return {"$set": document}
 
 def init_db(uri: str = None) -> bool:
     global _client, _db, _connected
@@ -116,14 +122,20 @@ def save_seen(seen_dict: dict, user_id: str = None):
                         'found_at': '',
                         'updated_at': datetime.now(timezone.utc).isoformat(),
                     }
-                ops.append(pymongo.UpdateOne({'user_id': uid, 'job_id': jid}, {'': doc}, upsert=True))
+                ops.append(
+                    pymongo.UpdateOne(
+                        {"user_id": uid, "job_id": jid},
+                        _mongo_set(doc),
+                        upsert=True,
+                    )
+                )
             if ops:
                 _db.seen_jobs.bulk_write(ops)
         except Exception as e:
             log.warning(f'[DB] MongoDB save_seen error: {e}')
     try:
         with open(SEEN_JOBS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(seen_dict, f, indent=2)
+            json.dump(seen_dict, f, indent=2, ensure_ascii=False)
     except Exception as e:
         log.warning(f'[DB] Save seen_jobs.json error: {e}')
 
@@ -175,7 +187,13 @@ def save_applied(data: dict, user_id: str = None):
                     'status': info.get('status', 'submitted'),
                     'note': info.get('note', ''),
                 }
-                ops.append(pymongo.UpdateOne({'user_id': uid, 'job_id': jid}, {'': doc}, upsert=True))
+                ops.append(
+                    pymongo.UpdateOne(
+                        {"user_id": uid, "job_id": jid},
+                        _mongo_set(doc),
+                        upsert=True,
+                    )
+                )
             if ops:
                 _db.applied_jobs.bulk_write(ops)
         except Exception as e:
@@ -224,7 +242,11 @@ def save_cycle_stats(stats: list):
         try:
             if stats:
                 latest = stats[-1]
-                _db.cycle_stats.update_one({'timestamp': latest.get('timestamp')}, {'': latest}, upsert=True)
+                _db.cycle_stats.update_one(
+                    {"timestamp": latest.get("timestamp")},
+                    _mongo_set(latest),
+                    upsert=True,
+                )
         except Exception as e:
             log.warning(f'[DB] MongoDB save_cycle_stats error: {e}')
     LOG_DIR.mkdir(exist_ok=True)
@@ -255,7 +277,13 @@ def save_raw_jobs(jobs_list: list):
                 'posted_at': j.get('posted_at', ''),
                 'last_scraped_at': now_iso,
             }
-            ops.append(pymongo.UpdateOne({'id': j['id']}, {'': doc}, upsert=True))
+            ops.append(
+                pymongo.UpdateOne(
+                    {"id": j["id"]},
+                    _mongo_set(doc),
+                    upsert=True,
+                )
+            )
         if ops:
             _db.jobs.bulk_write(ops)
     except Exception as e:
@@ -278,6 +306,10 @@ def save_user_profile(profile_data: dict, user_id: str = None):
         try:
             profile_data['user_id'] = uid
             profile_data['updated_at'] = datetime.now(timezone.utc).isoformat()
-            _db.user_profiles.update_one({'user_id': uid}, {'': profile_data}, upsert=True)
+            _db.user_profiles.update_one(
+                {"user_id": uid},
+                _mongo_set(profile_data),
+                upsert=True,
+            )
         except Exception as e:
             log.warning(f'[DB] MongoDB save_user_profile error: {e}')
