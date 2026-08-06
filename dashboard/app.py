@@ -577,7 +577,7 @@ def index():
 # -- Main ---------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("DASHBOARD_PORT", 8765))
+    port = int(os.environ.get("PORT", 8000))
     print(f"\n  JENT Dashboard running at http://localhost:{port}")
     print(f"  Reading data from: {BASE_DIR}\n")
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
