@@ -394,7 +394,15 @@ def api_create_order():
             "env": CASHFREE_ENV,
         })
     except Exception as e:
-        return jsonify({"error": f"Cashfree order creation failed: {e}"}), 500
+        error_msg = str(e)
+        try:
+            if hasattr(e, 'response') and e.response is not None:
+                error_msg = f"{error_msg} | Response: {e.response.text}"
+        except Exception:
+            pass
+        log.error(f"Cashfree order creation failed: {error_msg}")
+        log.error(f"Request payload: {json.dumps(payload, indent=2)}")
+        return jsonify({"error": f"Cashfree order creation failed: {error_msg}"}), 500
 
 
 @app.route("/api/payment-success")
