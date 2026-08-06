@@ -53,8 +53,8 @@ _cfg = _load_yaml_cfg()
 def _gcfg(key, default):
     return os.environ.get(key.upper(), _cfg.get(key.lower(), default))
 
-CASHFREE_APP_ID     = _gcfg("cashfree_app_id", "")
-CASHFREE_SECRET     = _gcfg("cashfree_secret_key", "")
+CASHFREE_APP_ID     = _gcfg("cashfree_app_id", "").strip()
+CASHFREE_SECRET     = _gcfg("cashfree_secret_key", "").strip()
 CASHFREE_ENV        = _gcfg("cashfree_env", "test")   # "test" or "prod"
 SUBSCRIPTION_AMT    = int(_gcfg("subscription_amount", 75))
 SUBSCRIPTION_REQ    = str(_gcfg("subscription_required", "true")).lower() == "true"
@@ -211,8 +211,8 @@ def get_active_subscriber() -> dict | None:
 
 def _cf_headers() -> dict:
     return {
-        "x-client-id": CASHFREE_APP_ID,
-        "x-client-secret": CASHFREE_SECRET,
+        "x-client-id": CASHFREE_APP_ID.strip(),
+        "x-client-secret": CASHFREE_SECRET.strip(),
         "x-api-version": "2023-08-01",
         "Content-Type": "application/json",
     }
