@@ -71,7 +71,10 @@ _CF_JS = (
     else "https://sdk.cashfree.com/js/v3/cashfree.js"
 )
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 app = Flask(__name__, static_folder=str(DASHBOARD_DIR), static_url_path="")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.config["MAX_CONTENT_LENGTH"] = MAX_RESUME_SIZE_BYTES
 
 import requests as _requests   # for Cashfree API calls
