@@ -1181,7 +1181,7 @@ def run_once():
                         "location": job.get("location", ""),
                     }
             save_seen(seen)
-    log.info("Cycle complete at %s.\n", datetime.now(timezone.utc).isoformat())
+        log.info("Cycle complete at %s.\n", datetime.now(timezone.utc).isoformat())
         return 0
 
     for job in ranked:
